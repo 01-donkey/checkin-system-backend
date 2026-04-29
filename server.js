@@ -60,7 +60,7 @@ app.post('/api/checkin', async (req, res) => {
     const [qrTimestamp, qrSignature] = token.split('.');
     const expectedSignature = crypto.createHmac('sha256', SECRET_KEY).update(`${location_id}:${qrTimestamp}`).digest('hex');
     if (qrSignature !== expectedSignature) return res.status(403).json({ success: false, message: '無效的打卡條碼！' });
-    if (Date.now() - parseInt(qrTimestamp) > 15000) return res.status(403).json({ success: false, message: '條碼已過期！請重新掃描。' });
+    if (Date.now() - parseInt(qrTimestamp) > 120000) return res.status(403).json({ success: false, message: '條碼已過期！請重新掃描。' });
 
     // 3. 查詢或自動註冊員工
     let worker;
