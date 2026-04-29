@@ -198,6 +198,80 @@ app.put('/api/settings', async (req, res) => {
   res.json({ success: true, message: '時間設定已更新！' });
 });
 
+// 4. 匯出 CSV 報表 (包含自動計算工時)
+app.post('/api/export', async (req, res) => {
+  try {
+    const { password } = req.body;
+    const sysRes = await pool.query('SELECT admin_password FROM SystemSettings LIMIT 1');
+    if (password !== sysRes.rows[0].admin_password) return res.status(403).json({ success: false, message: '密碼錯誤' });
+
+    // 撈取所有紀錄，依照時間順序排列
+    const result = await pool.query(`
+      SELECT CheckIns.worker_id, Workers.name AS worker_name, Locations.location_name, CheckIns.action, CheckIns.timestamp
+      FROM CheckIns 
+      JOIN Workers ON CheckIns.worker_id = Workers.id 
+      JOIN Locations ON CheckIns.location_id = Locations.id
+      ORDER BY CheckIns.timestamp ASC
+    `);
+
+    // 核心邏輯：將凌亂的紀錄依據「員工+日期」進行分組
+    const dailyData = {};
+
+    result.rows.forEach(r => {
+      // 轉換成台灣時間處理
+      const dateObj = new Date(r.timestamp);
+      const dateStr = dateObj.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }); // 例：2026/4/29
+      const timeStr = dateObj.toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
+      
+      const key = `${r.worker_id}_${dateStr}`; // 唯一識別碼：員工ID_日期
+
+      if (!dailyData[key]) {
+        dailyData[key] = {
+          name: r.worker_name,
+          date: dateStr,
+          location: r.location_name,
+          inTimeObj: null,
+          outTimeObj: null,
+          inTimeStr: '未簽到',
+          outTimeStr: '未簽退',
+          totalHours: 0
+        };
+      }
+
+      // 如果是簽到，且當天還沒簽到過 (抓取當天最早的一筆)
+      if (r.action === 'IN' && !dailyData[key].inTimeObj) {
+        dailyData[key].inTimeObj = dateObj;
+        dailyData[key].inTimeStr = timeStr;
+      } 
+      // 如果是簽退 (不斷覆蓋，抓取當天最晚的一筆)
+      else if (r.action === 'OUT') {
+        dailyData[key].outTimeObj = dateObj;
+        dailyData[key].outTimeStr = timeStr;
+      }
+    });
+
+    // 組合 CSV 字串 (\uFEFF 是為了讓 Excel 讀取中文不亂碼)
+    let csvContent = '\uFEFF姓名,日期,場地,簽到時間,簽退時間,總工時(小時)\n';
+    
+    Object.values(dailyData).forEach(d => {
+      // 如果有簽到也有簽退，就計算總工時
+      if (d.inTimeObj && d.outTimeObj) {
+        const diffMs = d.outTimeObj - d.inTimeObj;
+        d.totalHours = (diffMs / (1000 * 60 * 60)).toFixed(2); // 換算成小時，取到小數點後兩位
+      }
+      csvContent += `${d.name},${d.date},${d.location},${d.inTimeStr},${d.outTimeStr},${d.totalHours}\n`;
+    });
+
+    // 設定回傳格式為 CSV 檔案
+    res.header('Content-Type', 'text/csv; charset=utf-8');
+    res.send(csvContent);
+
+  } catch (err) {
+    console.error('匯出錯誤:', err);
+    res.status(500).json({ success: false, message: '伺服器內部錯誤' });
+  }
+});
+
 
 app.listen(PORT, () => {
   console.log(`🚀 後端伺服器已啟動：http://localhost:${PORT}`);
