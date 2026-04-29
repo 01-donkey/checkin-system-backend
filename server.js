@@ -39,30 +39,31 @@ app.get('/api/qr-token', (req, res) => {
   res.json({ success: true, token: `${timestamp}.${signature}`, location_id: location_id });
 });
 
+// 打卡 API
 app.post('/api/checkin', async (req, res) => {
   try {
-    const { name, phone_last4, location_id, action, lat, lng, token } = req.body;
+    // 1. 新增接收前端傳來的 force_overwrite 參數
+    const { name, phone_last4, location_id, action, lat, lng, token, force_overwrite } = req.body;
 
     if (!phone_last4 || !location_id || !action || !lat || !lng || !token) {
       return res.status(400).json({ success: false, message: '缺少必要參數' });
     }
 
-    // 1. 攔截非營業時間
+    // 攔截非營業時間
     const settingRes = await pool.query('SELECT open_time, close_time FROM SystemSettings LIMIT 1');
     const { open_time, close_time } = settingRes.rows[0];
     const tpeTime = new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei', hour12: false, hour: '2-digit', minute: '2-digit' });
-    
     if (tpeTime < open_time || tpeTime > close_time) {
       return res.status(403).json({ success: false, message: `目前非開放打卡時間 (${open_time} - ${close_time})，系統已關閉。` });
     }
 
-    // 2. 驗證 Token
+    // 驗證 Token (120 秒寬限期)
     const [qrTimestamp, qrSignature] = token.split('.');
     const expectedSignature = crypto.createHmac('sha256', SECRET_KEY).update(`${location_id}:${qrTimestamp}`).digest('hex');
     if (qrSignature !== expectedSignature) return res.status(403).json({ success: false, message: '無效的打卡條碼！' });
-    if (Date.now() - parseInt(qrTimestamp) > 120000) return res.status(403).json({ success: false, message: '條碼已過期！請重新掃描。' });
+    if (Date.now() - parseInt(qrTimestamp) > 120000) return res.status(403).json({ success: false, message: '條碼已過期！請重新掃描現場螢幕。' });
 
-    // 3. 查詢或自動註冊員工
+    // 查詢或自動註冊員工
     let worker;
     const workerRes = await pool.query('SELECT id, name FROM Workers WHERE phone_last4 = $1', [phone_last4]);
 
@@ -81,56 +82,63 @@ app.post('/api/checkin', async (req, res) => {
       worker = workerRes.rows[0];
     }
 
-    // ---------------------------------------------------------
-    // 🛡️ 【新增：雙重防呆機制】 🛡️
-    // ---------------------------------------------------------
-    const lastRecordRes = await pool.query(
-      'SELECT action, timestamp FROM CheckIns WHERE worker_id = $1 ORDER BY timestamp DESC LIMIT 1',
-      [worker.id]
-    );
-
+    // 【保留】防手抖防呆：1 分鐘內禁止連續點擊
+    const lastRecordRes = await pool.query('SELECT timestamp FROM CheckIns WHERE worker_id = $1 ORDER BY timestamp DESC LIMIT 1', [worker.id]);
     if (lastRecordRes.rows.length > 0) {
-      const lastRecord = lastRecordRes.rows[0];
-      const lastTime = new Date(lastRecord.timestamp).getTime();
-      const now = Date.now();
-      const diffMinutes = (now - lastTime) / (1000 * 60); // 計算距離上次打卡過了幾分鐘
-
-      // 第一重：1 分鐘內禁止連續打卡 (防手抖連點)
-      if (diffMinutes < 1) {
-        return res.status(403).json({ success: false, message: `打卡太頻繁！請等待 1 分鐘後再試。` });
-      }
-
-      // 第二重：狀態邏輯防呆 (假設 12 小時內的紀錄才算同一班別，超過 12 小時視為隔天新班表)
-      if (diffMinutes < 12 * 60) {
-        if (action === 'IN' && lastRecord.action === 'IN') {
-          return res.status(403).json({ success: false, message: `您目前已經是「簽到」狀態，請勿重複簽到！` });
-        }
-        if (action === 'OUT' && lastRecord.action === 'OUT') {
-          return res.status(403).json({ success: false, message: `您目前已經是「簽退」狀態，請勿重複簽退！` });
-        }
-      }
+      const diffMinutes = (Date.now() - new Date(lastRecordRes.rows[0].timestamp).getTime()) / 60000;
+      if (diffMinutes < 1) return res.status(403).json({ success: false, message: `打卡太頻繁！請等待 1 分鐘後再試。` });
     }
-    // ---------------------------------------------------------
 
-    // 4. 查詢場地與計算距離
+    // 查詢場地與計算距離
     const locRes = await pool.query('SELECT * FROM Locations WHERE id = $1', [location_id]);
     if (locRes.rows.length === 0) return res.status(500).json({ success: false, message: '找不到場地資料' });
     const location = locRes.rows[0];
-
     const distance = getDistanceFromLatLonInM(lat, lng, location.center_lat, location.center_lng);
-    if (distance > location.radius_meters) {
-      return res.status(403).json({ success: false, message: `打卡失敗：距離太遠 (${distance} 公尺)。` });
-    }
+    if (distance > location.radius_meters) return res.status(403).json({ success: false, message: `打卡失敗：距離太遠 (${distance} 公尺)。` });
 
-    // 5. 寫入打卡紀錄
-    await pool.query(
-      'INSERT INTO CheckIns (worker_id, location_id, action, device_gps_lat, device_gps_lng) VALUES ($1, $2, $3, $4, $5)',
-      [worker.id, location_id, action, lat, lng]
+    // ---------------------------------------------------------
+    // 🛡️ 【核心修改】：帶有確認機制的 Upsert 邏輯 🛡️
+    // ---------------------------------------------------------
+    const todayRecordRes = await pool.query(
+      `SELECT id, timestamp FROM CheckIns 
+       WHERE worker_id = $1 AND location_id = $2 AND action = $3 
+       AND timestamp >= CURRENT_DATE AT TIME ZONE 'Asia/Taipei'
+       AND timestamp < (CURRENT_DATE + 1) AT TIME ZONE 'Asia/Taipei'
+       LIMIT 1`,
+      [worker.id, location_id, action]
     );
 
-    const actionText = action === 'IN' ? '簽到' : '簽退';
-    const welcomeMsg = (action === 'IN' && workerRes.rows.length === 0) ? ' (系統已為您建檔)' : '';
-    res.json({ success: true, message: `✅ ${worker.name}，${actionText}成功！${welcomeMsg}`, distance: distance });
+    if (todayRecordRes.rows.length > 0) {
+      // 狀況 A：當天已有紀錄
+      if (!force_overwrite) {
+        // 第一回合：前端沒有帶強制覆蓋指令，後端回傳「要求確認」的訊號與對話框文字
+        const oldTime = new Date(todayRecordRes.rows[0].timestamp).toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
+        const actionText = action === 'IN' ? '簽到' : '簽退';
+        return res.json({ 
+          success: false, 
+          require_confirm: true, // 觸發前端彈出確認框的關鍵鑰匙
+          message: `您今天在 ${oldTime} 已經有一筆「${actionText}」紀錄了。\n\n請問是否要用現在的時間覆蓋原本的紀錄？` 
+        });
+      } else {
+        // 第二回合：前端帶了 force_overwrite: true 來了，正式執行 UPDATE 更新
+        const recordId = todayRecordRes.rows[0].id;
+        await pool.query(
+          `UPDATE CheckIns SET timestamp = CURRENT_TIMESTAMP, device_gps_lat = $1, device_gps_lng = $2 WHERE id = $3`,
+          [lat, lng, recordId]
+        );
+        const actionText = action === 'IN' ? '簽到' : '簽退';
+        return res.json({ success: true, message: `✅ ${worker.name}，您的「${actionText}」時間已成功更新！`, distance: distance });
+      }
+    } else {
+      // 狀況 B：當天尚無紀錄 -> 正常執行 INSERT 新增
+      await pool.query(
+        'INSERT INTO CheckIns (worker_id, location_id, action, device_gps_lat, device_gps_lng) VALUES ($1, $2, $3, $4, $5)',
+        [worker.id, location_id, action, lat, lng]
+      );
+      const actionText = action === 'IN' ? '簽到' : '簽退';
+      const welcomeMsg = (action === 'IN' && workerRes.rows.length === 0) ? ' (系統已為您建檔)' : '';
+      return res.json({ success: true, message: `✅ ${worker.name}，${actionText}成功！${welcomeMsg}`, distance: distance });
+    }
 
   } catch (err) {
     console.error('打卡 API 錯誤:', err);
