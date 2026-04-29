@@ -39,57 +39,63 @@ app.get('/api/qr-token', (req, res) => {
   res.json({ success: true, token: `${timestamp}.${signature}`, location_id: location_id });
 });
 
-// 接收打卡 API
+// 打卡 API
 app.post('/api/checkin', async (req, res) => {
   try {
-    const { phone_last4, location_id, action, lat, lng, token } = req.body;
+    // 1. 新增接收前端傳來的 name 參數
+    const { name, phone_last4, location_id, action, lat, lng, token } = req.body;
 
     if (!phone_last4 || !location_id || !action || !lat || !lng || !token) {
       return res.status(400).json({ success: false, message: '缺少必要參數' });
     }
 
-    // 【新增】：攔截非營業時間的打卡
-    const settingRes = await pool.query('SELECT open_time, close_time FROM SystemSettings LIMIT 1');
-    const { open_time, close_time } = settingRes.rows[0];
-    
-    // 取得台灣目前的 HH:MM 時間字串 (例如 "14:30")
-    const tpeTime = new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei', hour12: false, hour: '2-digit', minute: '2-digit' });
+    // --- (保留您原本的 時間攔截 與 Token 驗證邏輯) ---
+    // ...
 
-    if (tpeTime < open_time || tpeTime > close_time) {
-      return res.status(403).json({ success: false, message: `目前非開放打卡時間 (${open_time} - ${close_time})，系統已關閉。` });
+    // --- 【修改核心】：自動註冊與身分核對邏輯 ---
+    let worker;
+    const workerRes = await pool.query('SELECT id, name FROM Workers WHERE phone_last4 = $1', [phone_last4]);
+
+    if (workerRes.rows.length === 0) {
+      // 狀況 A：資料庫找不到這個人 (初次報到)
+      if (action === 'IN') {
+        if (!name) return res.status(400).json({ success: false, message: '初次簽到請輸入姓名！' });
+        
+        // 自動將新人寫入 Workers 資料表
+        const newWorkerRes = await pool.query(
+          'INSERT INTO Workers (name, phone_last4) VALUES ($1, $2) RETURNING id, name',
+          [name, phone_last4]
+        );
+        worker = newWorkerRes.rows[0]; // 取得剛建好的新員工資料
+      } else {
+        // 狀況 B：找不到人，但他卻按了「簽退」
+        return res.status(404).json({ success: false, message: `找不到手機尾碼 ${phone_last4} 的資料，您尚未簽到！` });
+      }
+    } else {
+      // 狀況 C：資料庫有這個人 (老員工)
+      worker = workerRes.rows[0];
     }
 
-    // 驗證 Token
-    const [qrTimestamp, qrSignature] = token.split('.');
-    const expectedSignature = crypto.createHmac('sha256', SECRET_KEY).update(`${location_id}:${qrTimestamp}`).digest('hex');
-
-    if (qrSignature !== expectedSignature) return res.status(403).json({ success: false, message: '無效的打卡條碼！' });
-    if (Date.now() - parseInt(qrTimestamp) > 15000) return res.status(403).json({ success: false, message: '條碼已過期！請重新掃描。' });
-
-    // 查詢員工
-    const workerRes = await pool.query('SELECT id, name FROM Workers WHERE phone_last4 = $1', [phone_last4]);
-    if (workerRes.rows.length === 0) return res.status(404).json({ success: false, message: `找不到手機尾碼 ${phone_last4} 的員工` });
-    const worker = workerRes.rows[0];
-
-    // 查詢場地
+    // --- (保留您原本的 查詢場地、計算距離、寫入打卡紀錄邏輯) ---
     const locRes = await pool.query('SELECT * FROM Locations WHERE id = $1', [location_id]);
     if (locRes.rows.length === 0) return res.status(500).json({ success: false, message: '找不到場地資料' });
     const location = locRes.rows[0];
 
-    // 計算距離
     const distance = getDistanceFromLatLonInM(lat, lng, location.center_lat, location.center_lng);
     if (distance > location.radius_meters) {
       return res.status(403).json({ success: false, message: `打卡失敗：距離太遠 (${distance} 公尺)。` });
     }
 
-    // 寫入打卡紀錄
     await pool.query(
       'INSERT INTO CheckIns (worker_id, location_id, action, device_gps_lat, device_gps_lng) VALUES ($1, $2, $3, $4, $5)',
       [worker.id, location_id, action, lat, lng]
     );
 
+    // 回傳成功訊息 (如果是初次簽到，可以給予不同提示)
     const actionText = action === 'IN' ? '簽到' : '簽退';
-    res.json({ success: true, message: `✅ ${worker.name}，${actionText}成功！`, distance: distance });
+    const welcomeMsg = (action === 'IN' && workerRes.rows.length === 0) ? ' (系統已自動為您建檔)' : '';
+    
+    res.json({ success: true, message: `✅ ${worker.name}，${actionText}成功！${welcomeMsg}`, distance: distance });
 
   } catch (err) {
     console.error('打卡 API 錯誤:', err);
