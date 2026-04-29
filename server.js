@@ -48,6 +48,17 @@ app.post('/api/checkin', async (req, res) => {
       return res.status(400).json({ success: false, message: '缺少必要參數' });
     }
 
+    // 【新增】：攔截非營業時間的打卡
+    const settingRes = await pool.query('SELECT open_time, close_time FROM SystemSettings LIMIT 1');
+    const { open_time, close_time } = settingRes.rows[0];
+    
+    // 取得台灣目前的 HH:MM 時間字串 (例如 "14:30")
+    const tpeTime = new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei', hour12: false, hour: '2-digit', minute: '2-digit' });
+
+    if (tpeTime < open_time || tpeTime > close_time) {
+      return res.status(403).json({ success: false, message: `目前非開放打卡時間 (${open_time} - ${close_time})，系統已關閉。` });
+    }
+
     // 驗證 Token
     const [qrTimestamp, qrSignature] = token.split('.');
     const expectedSignature = crypto.createHmac('sha256', SECRET_KEY).update(`${location_id}:${qrTimestamp}`).digest('hex');
@@ -85,6 +96,67 @@ app.post('/api/checkin', async (req, res) => {
     res.status(500).json({ success: false, message: '伺服器內部錯誤' });
   }
 });
+
+// --- 新增 API：獲取所有打卡紀錄 (供後台觀看) ---
+app.get('/api/records', async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        CheckIns.id,
+        Workers.name AS worker_name,
+        Locations.location_name,
+        CheckIns.action,
+        CheckIns.timestamp
+      FROM CheckIns
+      JOIN Workers ON CheckIns.worker_id = Workers.id
+      JOIN Locations ON CheckIns.location_id = Locations.id
+      ORDER BY CheckIns.timestamp DESC
+    `;
+    const result = await pool.query(query);
+    res.json({ success: true, records: result.rows });
+  } catch (err) {
+    console.error('獲取紀錄錯誤:', err);
+    res.status(500).json({ success: false, message: '無法獲取紀錄' });
+  }
+});
+
+
+// --- 後台管理專區 API ---
+
+// 1. 獲取打卡紀錄 (現在需要密碼了！)
+app.post('/api/records', async (req, res) => {
+  try {
+    const { password } = req.body;
+    const sysRes = await pool.query('SELECT admin_password FROM SystemSettings LIMIT 1');
+    if (password !== sysRes.rows[0].admin_password) return res.status(403).json({ success: false, message: '密碼錯誤' });
+
+    const result = await pool.query(`
+      SELECT CheckIns.id, Workers.name AS worker_name, Locations.location_name, CheckIns.action, CheckIns.timestamp
+      FROM CheckIns JOIN Workers ON CheckIns.worker_id = Workers.id JOIN Locations ON CheckIns.location_id = Locations.id
+      ORDER BY CheckIns.timestamp DESC
+    `);
+    res.json({ success: true, records: result.rows });
+  } catch (err) { res.status(500).json({ success: false }); }
+});
+
+// 2. 獲取目前營業時間 (需密碼)
+app.post('/api/settings', async (req, res) => {
+  const { password } = req.body;
+  const sysRes = await pool.query('SELECT * FROM SystemSettings LIMIT 1');
+  if (password !== sysRes.rows[0].admin_password) return res.status(403).json({ success: false });
+  res.json({ success: true, open_time: sysRes.rows[0].open_time, close_time: sysRes.rows[0].close_time });
+});
+
+// 3. 儲存新的營業時間 (需密碼)
+app.put('/api/settings', async (req, res) => {
+  const { password, open_time, close_time } = req.body;
+  const sysRes = await pool.query('SELECT admin_password FROM SystemSettings LIMIT 1');
+  if (password !== sysRes.rows[0].admin_password) return res.status(403).json({ success: false, message: '密碼錯誤' });
+
+  await pool.query('UPDATE SystemSettings SET open_time = $1, close_time = $2', [open_time, close_time]);
+  res.json({ success: true, message: '時間設定已更新！' });
+});
+
 
 app.listen(PORT, () => {
   console.log(`🚀 後端伺服器已啟動：http://localhost:${PORT}`);
