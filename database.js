@@ -50,14 +50,38 @@ async function initDB() {
       );
     `);
 
-    // 寫入預設的兩筆場地與兩位員工 (防呆：若已有資料則不重複寫入)
-    const locRes = await pool.query("SELECT count(*) FROM Locations");
-    if (parseInt(locRes.rows[0].count) === 0) {
-      await pool.query(`DELETE FROM Locations`);
-      await pool.query(`INSERT INTO Locations (location_name, center_lat, center_lng, radius_meters) VALUES ('西岸 SNA', 25.135038, 121.740989, 100)`);
-      await pool.query(`INSERT INTO Locations (location_name, center_lat, center_lng, radius_meters) VALUES ('東岸 COSTA', 25.042222, 121.553333, 100)`);
+// --- 【智慧同步地點資料】開始 ---
+    // 1. 在這裡定義您「最新」的地點與經緯度設定
+    const targetLocations = [
+      { name: '西岸 SNA', lat: 25.135038, lng: 121.740989, radius: 100 },
+      { name: '東岸 COSTA', lat: 25.042222, lng: 121.553333, radius: 100 }
+    ];
 
+    // 2. 遍歷檢查並同步到資料庫
+    for (const loc of targetLocations) {
+      // 檢查這個地點名稱是否已經存在於資料庫中
+      const checkRes = await pool.query(
+        "SELECT id FROM Locations WHERE location_name = $1", 
+        [loc.name]
+      );
+      
+      if (checkRes.rows.length > 0) {
+        // [狀況 A] 如果地點已存在 -> 無條件「更新」成最新的經緯度與半徑
+        await pool.query(
+          "UPDATE Locations SET center_lat = $1, center_lng = $2, radius_meters = $3 WHERE location_name = $4",
+          [loc.lat, loc.lng, loc.radius, loc.name]
+        );
+      } else {
+        // [狀況 B] 如果地點不存在 -> 執行「新增」
+        await pool.query(
+          "INSERT INTO Locations (location_name, center_lat, center_lng, radius_meters) VALUES ($1, $2, $3, $4)",
+          [loc.name, loc.lat, loc.lng, loc.radius]
+        );
+      }
     }
+    console.log('✅ 地點資料同步完成！已確保資料庫與程式碼設定完全一致。');
+    // --- 【智慧同步地點資料】結束 ---
+
   } catch (err) {
     console.error('初始化資料表失敗：', err);
   }
