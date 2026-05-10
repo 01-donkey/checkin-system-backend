@@ -85,8 +85,8 @@ app.post('/api/checkin', async (req, res) => {
     // 【保留】防手抖防呆：1 分鐘內禁止連續點擊
     const lastRecordRes = await pool.query('SELECT timestamp FROM CheckIns WHERE worker_id = $1 ORDER BY timestamp DESC LIMIT 1', [worker.id]);
     if (lastRecordRes.rows.length > 0) {
-      const diffMinutes = (Date.now() - new Date(lastRecordRes.rows[0].timestamp).getTime()) / 60000;
-      if (diffMinutes < 1) return res.status(403).json({ success: false, message: `打卡太頻繁！請等待 1 分鐘後再試。` });
+      const diffMinutes = (Date.now() - new Date(lastRecordRes.rows[0].timestamp).getTime()) / 30000;
+      if (diffMinutes < 1) return res.status(403).json({ success: false, message: `打卡太頻繁！請等待 30 秒後再試。` });
     }
 
     // 查詢場地與計算距離
@@ -261,14 +261,34 @@ app.post('/api/export', async (req, res) => {
     // 組合 CSV 字串 (\uFEFF 是為了讓 Excel 讀取中文不亂碼)
     let csvContent = '\uFEFF姓名,日期,場地,簽到時間,簽退時間,總工時(小時)\n';
     
-    Object.values(dailyData).forEach(d => {
-      // 如果有簽到也有簽退，就計算總工時
-      if (d.inTimeObj && d.outTimeObj) {
-        const diffMs = d.outTimeObj - d.inTimeObj;
-        d.totalHours = (diffMs / (1000 * 60 * 60)).toFixed(2); // 換算成小時，取到小數點後兩位
-      }
-      csvContent += `${d.name},${d.date},${d.location},${d.inTimeStr},${d.outTimeStr},${d.totalHours}\n`;
-    });
+
+Object.values(dailyData).forEach(d => {
+  // 預設工時為空字串，避免缺卡時印出 undefined
+  d.totalHours = ""; 
+
+  // 如果有簽到也有簽退，就計算總工時
+  if (d.inTimeObj && d.outTimeObj) {
+    const diffMs = d.outTimeObj - d.inTimeObj;
+    
+    // 先算出總共幾分鐘 (無條件捨去小數點)
+    const totalMins = Math.floor(diffMs / (1000 * 60));
+    
+    // 計算出小時與剩餘的分鐘
+    const hours = Math.floor(totalMins / 60);
+    const mins = totalMins % 60;
+    
+    // 格式化為 HH:MM (例如 08:30)，補零讓排版更整齊
+    const formattedHours = String(hours).padStart(2, '0');
+    const formattedMins = String(mins).padStart(2, '0');
+    
+    d.totalHours = `${formattedHours}:${formattedMins}`;
+    
+    // 💡 如果您老闆真的強烈要求要印出中文，請把上面那行註解掉，改用下面這行：
+    // d.totalHours = `${hours}小時${mins}分`;
+  }
+  
+  csvContent += `${d.name},${d.date},${d.location},${d.inTimeStr},${d.outTimeStr},${d.totalHours}\n`;
+});
 
     // 設定回傳格式為 CSV 檔案
     res.header('Content-Type', 'text/csv; charset=utf-8');
